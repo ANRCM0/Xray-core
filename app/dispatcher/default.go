@@ -142,7 +142,10 @@ func (*DefaultDispatcher) Close() error { return nil }
 // bandwidthManagerFromContext locates the per-user limiter feature without
 // modifying the transport's concrete pipe reader (required by mux/XUDP).
 func bandwidthManagerFromContext(ctx context.Context) bandwidth.Manager {
-	inst := core.MustFromContext(ctx)
+	inst := core.FromContext(ctx)
+	if inst == nil {
+		return nil
+	}
 	if feature := inst.GetFeature(bandwidth.ManagerType()); feature != nil {
 		manager, _ := feature.(bandwidth.Manager)
 		return manager
