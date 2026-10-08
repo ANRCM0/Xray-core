@@ -15,6 +15,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/outbound"
 	"github.com/xtls/xray-core/features/policy"
@@ -138,7 +139,33 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
+// bandwidthManagerFromContext locates the per-user limiter feature without
+// modifying the transport's concrete pipe reader (required by mux/XUDP).
+func bandwidthManagerFromContext(ctx context.Context) bandwidth.Manager {
+	inst := core.FromContext(ctx)
+	if inst == nil {
+		return nil
+	}
+	if feature := inst.GetFeature(bandwidth.ManagerType()); feature != nil {
+		manager, _ := feature.(bandwidth.Manager)
+		return manager
+	}
+	return nil
+}
+
+func applyBandwidthLimit(ctx context.Context, writer buf.Writer, manager bandwidth.Manager, user *protocol.MemoryUser) buf.Writer {
+	if manager == nil || user == nil || user.Email == "" {
+		return writer
+	}
+	limiter := manager.GetUserLimiter(user.Email)
+	if limiter == nil {
+		return writer
+	}
+	return &RateLimitWriter{Writer: writer, Limiter: limiter, Context: ctx}
+}
+
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
+	manager := bandwidthManagerFromContext(ctx)
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
@@ -170,6 +197,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 				}
 			}
 		}
+		inboundLink.Writer = applyBandwidthLimit(ctx, inboundLink.Writer, manager, user)
 		if p.Stats.UserDownlink {
 			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
 			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
@@ -180,6 +208,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 			}
 		}
 
+		outboundLink.Writer = applyBandwidthLimit(ctx, outboundLink.Writer, manager, user)
 		if p.Stats.UserOnline {
 			name := "user>>>" + user.Email + ">>>online"
 			if om, _ := stats.GetOrRegisterOnlineMap(d.stats, name); om != nil {
@@ -201,6 +230,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	}
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
+	manager := bandwidthManagerFromContext(ctx)
 
 	if user != nil && len(user.Email) > 0 {
 		p := policyManager.ForLevel(user.Level)
@@ -219,6 +249,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 				}
 			}
 		}
+		link.Writer = applyBandwidthLimit(ctx, link.Writer, manager, user)
 		if p.Stats.UserOnline {
 			name := "user>>>" + user.Email + ">>>online"
 			if om, _ := stats.GetOrRegisterOnlineMap(statsManager, name); om != nil {
